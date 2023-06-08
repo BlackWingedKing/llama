@@ -1,25 +1,24 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the GNU General Public License version 3.
 
-from typing import Tuple
+import json
 import os
 import sys
-import torch
-import fire
 import time
-import json
-
 from pathlib import Path
+from typing import Any, Tuple
 
+import fire
+import torch
 from fairscale.nn.model_parallel.initialize import initialize_model_parallel
 
-from llama import ModelArgs, Transformer, Tokenizer, LLaMA
+from llama import LLaMA, ModelArgs, Tokenizer, Transformer
 
 
 def setup_model_parallel(use_cpu: bool = False) -> Tuple[int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     world_size = int(os.environ.get("WORLD_SIZE", -1))
-    
+
     if use_cpu:
         torch.distributed.init_process_group("gloo")
     else:
@@ -41,7 +40,7 @@ def load(
     max_seq_len: int,
     max_batch_size: int,
     use_cpu: bool,
-) -> LLaMA:
+) -> Tuple[LLaMA, Any]:
     start_time = time.time()
     checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
     assert world_size == len(
@@ -54,7 +53,10 @@ def load(
         params = json.loads(f.read())
 
     model_args: ModelArgs = ModelArgs(
-        max_seq_len=max_seq_len, max_batch_size=max_batch_size, use_cpu=use_cpu, **params
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        use_cpu=use_cpu,
+        **params,
     )
     tokenizer = Tokenizer(model_path=tokenizer_path)
     model_args.vocab_size = tokenizer.n_words
@@ -66,7 +68,7 @@ def load(
 
     generator = LLaMA(model, tokenizer)
     print(f"Loaded in {time.time() - start_time:.2f} seconds")
-    return generator
+    return generator, model
 
 
 def main(
@@ -82,8 +84,14 @@ def main(
     if local_rank > 0:
         sys.stdout = open(os.devnull, "w")
 
-    generator = load(
-        ckpt_dir, tokenizer_path, local_rank, world_size, max_seq_len, max_batch_size, use_cpu
+    generator, _ = load(
+        ckpt_dir,
+        tokenizer_path,
+        local_rank,
+        world_size,
+        max_seq_len,
+        max_batch_size,
+        use_cpu,
     )
 
     prompts = [

@@ -5,8 +5,8 @@ from typing import List
 
 import torch
 
-from llama.tokenizer import Tokenizer
 from llama.model import Transformer
+from llama.tokenizer import Tokenizer
 
 
 class LLaMA:
@@ -22,35 +22,74 @@ class LLaMA:
         top_p: float = 0.95,
         use_cpu: bool = False,
     ) -> List[str]:
+        # prompts will be ["Hi", "Hello how are you?"]...
+        # ["Hello", "I fine"]
+        # assume max_gen_len is 2
+        # number of generations -> for simplicity consider this to be 2
         bsz = len(prompts)
         params = self.model.params
+
+        # ensure input len is less than set params
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
+        # tokenize the list of inputs
+        # output will be something like [[12], [5, 6, 7, 9, 10]]
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
 
+        # max, min = 5,1
         min_prompt_size = min([len(t) for t in prompt_tokens])
         max_prompt_size = max([len(t) for t in prompt_tokens])
 
+        # 7
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_size)
         if use_cpu:
+            # initialize the (bsz, total_len) matrix default padding value
+            # pad_id is usually -1
             tokens = torch.full((bsz, total_len), self.tokenizer.pad_id).long()
         else:
             tokens = torch.full((bsz, total_len), self.tokenizer.pad_id).cuda().long()
+        # fill the tokens matrix with the prompt tokens
+        # [[12, -1, -1, -1, -1, -1]
+        # [5, 6, 7, 9, 10, 56, -1]]
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t).long()
+
+        # true for all non-pad tokens
+        # [[1, 0, 0, 0, 0, 0, 0]]
+        # [1,1,1,1,1, 0, 0]]
         input_text_mask = tokens != self.tokenizer.pad_id
-        start_pos = min_prompt_size
+
+        # from where do we wanna generate
+        start_pos = min_prompt_size  # 1
         prev_pos = 0
+
         for cur_pos in range(start_pos, total_len):
-            print(f'Generate Process:{round((cur_pos/total_len)*100,2)}%')
+            print(f"Generate Process:{round((cur_pos/total_len)*100,2)}%")
+            # take at [prev_pos:curr_pos]
+            # sample inputs for 0th iteration are sliced tokens
+            # [[12, 5]]
+            # [5, 6]]
+
+            # prev_pos is 1
+            # curr_pos is 2
+
+            # tokens[:, prev_pos:cur_pos]
+            # [5, -1]
+            # [6, 7]
+
+            # prev_pos is 0
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            # list of probs over vocab
+            # sampling for next token
+            # ignore this and assume greedy for now
             if temperature > 0:
                 probs = torch.softmax(logits / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
+
             else:
                 next_token = torch.argmax(logits, dim=-1)
-            next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
+            next_token = next_token.reshape(-1)  # get to single dim
+            # !! only replace token if prompt has already been generated
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )

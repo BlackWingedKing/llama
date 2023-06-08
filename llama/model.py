@@ -1,20 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the GNU General Public License version 3.
 
-from typing import Optional, Tuple
-from dataclasses import dataclass
 import math
-
-import torch
-from torch import nn
-import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import fairscale.nn.model_parallel.initialize as fs_init
+import torch
+import torch.nn.functional as F
 from fairscale.nn.model_parallel.layers import (
+    ColumnParallelLinear,
     ParallelEmbedding,
     RowParallelLinear,
-    ColumnParallelLinear,
 )
+from torch import nn
 
 
 @dataclass
@@ -38,13 +37,19 @@ class RMSNorm(torch.nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
+        # x * 1/||x||_2 --> row wise
+        # pow -> element wise operation
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # x/||x||_2 * W
+        # simple linear layer with normalized input
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
 
+# outputs a matrix of complex numbers
+# for encoding...
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -109,23 +114,49 @@ class Attention(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
-        
+
         if not args.use_cpu:
             self.cache_k = torch.zeros(
-                (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_heads,
+                    self.head_dim,
+                )
             ).cuda()
             self.cache_v = torch.zeros(
-                (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_heads,
+                    self.head_dim,
+                )
             ).cuda()
         else:
             self.cache_k = torch.zeros(
-                (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_heads,
+                    self.head_dim,
+                )
             )
             self.cache_v = torch.zeros(
-                (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
+                (
+                    args.max_batch_size,
+                    args.max_seq_len,
+                    self.n_local_heads,
+                    self.head_dim,
+                )
             )
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
@@ -152,9 +183,7 @@ class Attention(nn.Module):
             scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
-        output = output.transpose(
-            1, 2
-        ).contiguous().view(bsz, seqlen, -1)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
         return self.wo(output)
 
@@ -181,6 +210,7 @@ class FeedForward(nn.Module):
         )
 
     def forward(self, x):
+        # W2 @ (silu(W1 @ x) @ (W3 @ x))
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
@@ -198,8 +228,20 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
-        h = x + self.attention.forward(self.attention_norm(x), start_pos, freqs_cis, mask)
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        # x + attention(layer_norm(x))
+        # this makes the residual connection.
+        h = x + self.attention.forward(
+            self.attention_norm(x), start_pos, freqs_cis, mask
+        )
+
+        # FF(layer_norm(h))
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
@@ -211,33 +253,47 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
+        # embedding mapping
+        # 50257, 4096 (vocab_size x dim), the numbers are a co-pilot recomm...
         self.tok_embeddings = ParallelEmbedding(
             params.vocab_size, params.dim, init_method=lambda x: x
         )
 
         self.layers = torch.nn.ModuleList()
+        # n_layers = 32 for llama 7B
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
+        # single norm layer
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        # output layer --> d x vocab_size
         self.output = ColumnParallelLinear(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
+        # args
+        # 4096//32, 7*2
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
     @torch.inference_mode()
+    # [[1, 2, 4, 5, 6], [12,4 ]]
     def forward(self, tokens: torch.Tensor, start_pos: int):
         _bsz, seqlen = tokens.shape
+        # get the token embeddings
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
+        # slice from (start, start + seqlen) this is needed for input pos identification.
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
 
         mask = None
         if seqlen > 1:
-            mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.full(
+                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
+            )
+            # upper triangular part of the tensor
+            # since it's a multi dim tensor, we need to specify the diagonal
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
         for layer in self.layers:
